@@ -7,7 +7,16 @@ around anything on screen, then:
 - **Ask AI**: sends the crop and prompt to **Groq, Gemini, ChatGPT or Claude** and shows a
   short answer in a translucent bubble next to your cursor.
 
-## Install (1 minute)
+## Quick setup
+
+```sh
+git clone https://github.com/nevil-sanish/circle-to-search-linux && cd circle-to-search-linux && ./install.sh
+circle-to-search setup     # add your Groq / Gemini / ChatGPT / Claude API key and pick a model
+```
+
+That's it: shake the mouse or press `Ctrl+Alt+G`, drag a box.
+
+## Install (step by step)
 
 ```sh
 git clone https://github.com/nevil-sanish/circle-to-search-linux
