@@ -1,0 +1,513 @@
+#!/usr/bin/env python3
+# Wiggle the cursor (or Ctrl+Alt+G) -> star follows it for 3s -> click-drag a box
+# -> prompt box: Google Lens or Ask AI. No drag within 3s (or Esc) -> cancelled.
+# Ctrl+Alt+G answers stay hidden; hold Ctrl+Alt+A to see them.
+# `circle-to-search setup` = add API keys (groq/gemini/openai/claude) and pick a model.
+# Signals: SIGUSR1 = trigger, SIGUSR2 = reveal (sent repeatedly while key held).
+import os, sys, math, json, socket, signal, subprocess, time, base64, tempfile, threading
+from urllib.parse import quote_plus
+import gi, cairo
+gi.require_version("Gtk", "3.0")
+gi.require_version("GtkLayerShell", "0.1")
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import Gtk, Gdk, GLib, GdkPixbuf, GtkLayerShell
+
+# Tuning knobs
+POLL_MS = 30          # cursor sample rate
+WINDOW_S = 0.9        # wiggle must happen within this time
+MIN_SWING = 120       # px a stroke must travel to count
+MAX_STROKE_S = 0.18   # a stroke slower than this doesn't count (= only fast, hard shakes)
+REVERSALS = 5         # direction changes needed
+MIN_OPPOSITE = 0.8    # how directly a stroke must reverse the last one (1 = exactly back)
+STAR_SIZE = 28
+TIMEOUT_S = 3         # time to start dragging before it cancels
+AI_MAX_SIDE = 768     # px; image is downscaled to this before upload (fewer image tokens)
+AI_MAX_TOKENS = 200   # answer length cap
+AI_SYSTEM = "Answer in at most 2 short sentences. No preamble, no markdown."
+POPUP_S = 15          # shake-mode answer auto-hides after this
+
+SOCK = f"{os.environ.get('XDG_RUNTIME_DIR')}/hypr/{os.environ.get('HYPRLAND_INSTANCE_SIGNATURE')}/.socket.sock"
+CACHE = os.path.expanduser("~/.cache/circle-to-search")  # not /tmp: sandboxed browsers can't see it
+CONFIG = os.path.expanduser("~/.config/circle-to-search/config.json")
+# OpenAI-compatible chat endpoints; claude uses its own Messages API.
+PROVIDERS = {
+    "groq": "https://api.groq.com/openai/v1",
+    "gemini": "https://generativelanguage.googleapis.com/v1beta/openai",
+    "openai": "https://api.openai.com/v1",
+    "claude": "https://api.anthropic.com/v1",
+}
+NOT_CHAT = ("embed", "tts", "whisper", "dall-e", "audio", "realtime", "moderation", "transcribe",
+            "image", "guard", "sora", "computer", "babbage", "davinci", "aqa", "imagen", "veo")
+
+# The browser itself uploads, so the Lens session belongs to the browser (curl upload => "expired").
+# Lens carries ?q= through to the results page, so the prompt refines the image search.
+PAGE = """<!doctype html><meta charset=utf-8><title>Lens</title>
+<form id=f method=POST enctype=multipart/form-data action="https://lens.google.com/v3/upload%s">
+<input type=file name=encoded_image id=i></form><script>
+const b=atob("%s"),a=new Uint8Array(b.length);for(let k=0;k<b.length;k++)a[k]=b.charCodeAt(k);
+const d=new DataTransfer();d.items.add(new File([a],"s.png",{type:"image/png"}));
+i.files=d.files;f.submit();</script>"""
+
+
+def load_cfg():
+    try:
+        with open(CONFIG) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_cfg(cfg):
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+    fd = os.open(CONFIG, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)  # holds API keys
+    with os.fdopen(fd, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+
+def _headers(p, key):
+    if p == "claude":
+        return {"x-api-key": key, "anthropic-version": "2023-06-01"}
+    return {"Authorization": f"Bearer {key}"}
+
+
+def _check(r):
+    if r.ok:
+        return r.json()
+    try:
+        e = r.json()
+        e = (e[0] if isinstance(e, list) else e)["error"]
+        msg = e.get("message", e) if isinstance(e, dict) else e
+    except Exception:
+        msg = r.text
+    raise RuntimeError(f"{r.status_code}: {str(msg)[:200]}")
+
+
+def list_models(p, key):
+    import requests
+    data = _check(requests.get(f"{PROVIDERS[p]}/models", headers=_headers(p, key), timeout=15))["data"]
+    ids = (m["id"].removeprefix("models/") for m in data)
+    return sorted(i for i in ids if not any(w in i for w in NOT_CHAT))
+
+
+def setup():
+    from getpass import getpass
+    cfg = load_cfg()
+    keys = cfg.setdefault("keys", {})
+    print(f"API keys are saved to {CONFIG} (mode 600). Enter keeps the current value.")
+    for p in PROVIDERS:
+        k = getpass(f"  {p} API key [{'set' if keys.get(p) else 'not set'}]: ").strip()
+        if k == "-":
+            keys.pop(p, None)
+        elif k:
+            keys[p] = k
+    have = [p for p in PROVIDERS if keys.get(p)]
+    if not have:
+        save_cfg(cfg)
+        return print("No keys set; Ask AI stays disabled.")
+    for i, p in enumerate(have, 1):
+        print(f"  {i}) {p}{'  (current)' if p == cfg.get('provider') else ''}")
+    c = input("Provider number [Enter = current]: ").strip()
+    p = have[int(c) - 1] if c.isdigit() and 0 < int(c) <= len(have) else cfg.get("provider", have[0])
+    if p not in have:
+        p = have[0]
+    try:
+        models = list_models(p, keys[p])
+    except Exception as e:
+        models = []
+        print(f"Couldn't list models ({e}); type the model id.")
+    for i, m in enumerate(models, 1):
+        print(f"  {i}) {m}")
+    cur = cfg.get("models", {}).get(p, "")
+    c = input(f"Model number or id (needs vision) [{cur or 'required'}]: ").strip()
+    m = models[int(c) - 1] if c.isdigit() and 0 < int(c) <= len(models) else (c or cur)
+    if not m:
+        return print("No model chosen; nothing changed.")
+    cfg["provider"] = p
+    cfg.setdefault("models", {})[p] = m
+    save_cfg(cfg)
+    print(f"Using {p} / {m}. Running daemon picks this up on the next search.")
+
+
+def ask_llm(jpeg, prompt):
+    import requests
+    cfg = load_cfg()
+    p = cfg.get("provider")
+    key, model = cfg.get("keys", {}).get(p), cfg.get("models", {}).get(p)
+    if not (key and model):
+        raise RuntimeError("No AI set up. Run: circle-to-search setup")
+    img, q = base64.b64encode(jpeg).decode(), prompt or "What is this?"
+    if p == "claude":
+        body = {"model": model, "max_tokens": AI_MAX_TOKENS, "system": AI_SYSTEM, "messages": [{
+            "role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img}},
+                {"type": "text", "text": q}]}]}
+        r = _check(requests.post(f"{PROVIDERS[p]}/messages", headers=_headers(p, key), json=body, timeout=40))
+        return "".join(b.get("text", "") for b in r["content"]).strip()
+    image = {"url": f"data:image/jpeg;base64,{img}"}
+    if p == "openai":
+        image["detail"] = "low"  # flat ~85 tokens per image
+    body = {"model": model, "messages": [
+        {"role": "system", "content": AI_SYSTEM},
+        {"role": "user", "content": [{"type": "text", "text": q}, {"type": "image_url", "image_url": image}]}]}
+    # newer OpenAI models reject max_tokens
+    body["max_completion_tokens" if p == "openai" else "max_tokens"] = AI_MAX_TOKENS
+    r = _check(requests.post(f"{PROVIDERS[p]}/chat/completions", headers=_headers(p, key), json=body, timeout=40))
+    return (r["choices"][0]["message"].get("content") or "(empty answer, try a non-reasoning model)").strip()
+
+
+def shrink(png):
+    """PNG bytes -> JPEG bytes, longest side <= AI_MAX_SIDE."""
+    ld = GdkPixbuf.PixbufLoader()
+    ld.write(png)
+    ld.close()
+    pb = ld.get_pixbuf()
+    s = min(1, AI_MAX_SIDE / max(pb.get_width(), pb.get_height()))
+    if s < 1:
+        pb = pb.scale_simple(int(pb.get_width() * s), int(pb.get_height() * s), GdkPixbuf.InterpType.BILINEAR)
+    return pb.save_to_bufferv("jpeg", ["quality"], ["80"])[1]
+
+
+def cursor():
+    with socket.socket(socket.AF_UNIX) as s:
+        s.connect(SOCK)
+        s.sendall(b"cursorpos")
+        x, y = s.recv(64).decode().split(",")
+    return int(x), int(y)
+
+
+def lens(png, prompt):
+    os.makedirs(CACHE, exist_ok=True)
+    q = f"?q={quote_plus(prompt)}" if prompt else ""
+    with tempfile.NamedTemporaryFile("w", dir=CACHE, suffix=".html", delete=False) as f:
+        f.write(PAGE % (q, base64.b64encode(png).decode()))
+    subprocess.Popen(["xdg-open", f.name])
+    # ponytail: old pages pile up in ~/.cache/circle-to-search; wiped on each start
+
+
+CSS = b"""
+.lw-box { background: rgba(22,22,30,0.80); border-radius: 12px; padding: 8px; }
+.lw-box label { color: #f2f2f7; font-size: 14px; }
+.lw-box entry { min-width: 260px; }
+"""
+
+
+def layer(win, keyboard):
+    win.set_visual(win.get_screen().get_rgba_visual())
+    win.set_app_paintable(True)
+    GtkLayerShell.init_for_window(win)
+    GtkLayerShell.set_layer(win, GtkLayerShell.Layer.OVERLAY)
+    GtkLayerShell.set_anchor(win, GtkLayerShell.Edge.LEFT, True)
+    GtkLayerShell.set_anchor(win, GtkLayerShell.Edge.TOP, True)
+    GtkLayerShell.set_keyboard_mode(win, keyboard)
+    win.connect("draw", lambda _, cr: (cr.set_operator(cairo.OPERATOR_SOURCE), cr.set_source_rgba(0, 0, 0, 0), cr.paint()) and False)
+
+
+def place(win, x, y):
+    """Put a layer window at global (x, y), kept inside that monitor."""
+    mon = Gdk.Display.get_default().get_monitor_at_point(x, y)
+    g = mon.get_geometry()
+    w, h = (s := win.get_preferred_size()[1]).width, s.height
+    GtkLayerShell.set_monitor(win, mon)
+    GtkLayerShell.set_margin(win, GtkLayerShell.Edge.LEFT, max(0, min(x - g.x, g.width - w - 8)))
+    GtkLayerShell.set_margin(win, GtkLayerShell.Edge.TOP, max(0, min(y - g.y, g.height - h - 8)))
+
+
+class Popup(Gtk.Window):
+    """Click-through answer bubble near the cursor."""
+
+    def __init__(self):
+        super().__init__()
+        layer(self, GtkLayerShell.KeyboardMode.NONE)
+        self.label = Gtk.Label(wrap=True, max_width_chars=48, xalign=0, selectable=False)
+        box = Gtk.Box()
+        box.get_style_context().add_class("lw-box")
+        box.add(self.label)
+        self.add(box)
+        self.timer, self.holding = None, False
+
+    def show_text(self, text, ms):
+        self.label.set_text(text)
+        if not self.get_visible():
+            self.get_child().show_all()  # so the size is known before placing
+            x, y = cursor()
+            place(self, x + 22, y + 22)
+            self.show_all()
+            self.get_window().input_shape_combine_region(cairo.Region(), 0, 0)  # clicks pass through
+        self.hide_in(ms)
+
+    def hide_in(self, ms):
+        if self.timer:
+            GLib.source_remove(self.timer)
+        self.timer = GLib.timeout_add(ms, self.done)
+
+    def done(self):
+        self.timer, self.holding = None, False
+        self.hide()
+        return False
+
+
+class Chooser(Gtk.Window):
+    """Prompt box after a selection: Enter / Ask AI, or Google Lens. Esc cancels."""
+
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        layer(self, GtkLayerShell.KeyboardMode.EXCLUSIVE)
+        self.entry = Gtk.Entry(placeholder_text="Optional prompt…")
+        self.entry.connect("activate", lambda *_: self.go(True))
+        b_lens, b_ai = Gtk.Button(label="Google Lens"), Gtk.Button(label="Ask AI ⏎")
+        b_lens.connect("clicked", lambda *_: self.go(False))
+        b_ai.connect("clicked", lambda *_: self.go(True))
+        box = Gtk.Box(spacing=6)
+        box.get_style_context().add_class("lw-box")
+        for w in (self.entry, b_lens, b_ai):
+            box.add(w)
+        self.add(box)
+        self.connect("key-press-event", lambda _, ev: ev.keyval == Gdk.KEY_Escape and self.hide())
+
+    def open(self, png, x, y):
+        self.png = png
+        self.entry.set_text("")
+        self.get_child().show_all()
+        place(self, x, y)
+        self.show_all()
+        self.entry.grab_focus()
+
+    def go(self, ai):
+        self.hide()
+        prompt = self.entry.get_text().strip()
+        self.app.ask(self.png, prompt) if ai else lens(self.png, prompt)
+
+
+def star(cr, x, y):
+    s, r = STAR_SIZE, STAR_SIZE / 2
+    cx, cy = x + 14 + r, y + 14 + r
+    cr.move_to(cx, cy - r)
+    for px, py in [(cx + r, cy), (cx, cy + r), (cx - r, cy), (cx, cy - r)]:
+        cr.curve_to(cx, cy, cx, cy, px, py)  # concave sides = sparkle
+    g = cairo.LinearGradient(cx - r, cy + r, cx + r, cy - r)
+    g.add_color_stop_rgb(0, 0.26, 0.52, 0.96)
+    g.add_color_stop_rgb(1, 0.66, 0.42, 0.95)
+    cr.set_source(g)
+    cr.fill()
+
+
+class Overlay(Gtk.Window):
+    """Transparent fullscreen layer: draws the star at the cursor and captures the drag."""
+
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        self.set_visual(self.get_screen().get_rgba_visual())
+        self.set_app_paintable(True)
+        GtkLayerShell.init_for_window(self)
+        GtkLayerShell.set_layer(self, GtkLayerShell.Layer.OVERLAY)
+        for e in (GtkLayerShell.Edge.LEFT, GtkLayerShell.Edge.RIGHT, GtkLayerShell.Edge.TOP, GtkLayerShell.Edge.BOTTOM):
+            GtkLayerShell.set_anchor(self, e, True)
+        GtkLayerShell.set_exclusive_zone(self, -1)
+        GtkLayerShell.set_keyboard_mode(self, GtkLayerShell.KeyboardMode.EXCLUSIVE)
+        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK
+                        | Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.KEY_PRESS_MASK)
+        self.connect("draw", self.draw)
+        self.connect("motion-notify-event", self.motion)
+        self.connect("button-press-event", self.press)
+        self.connect("button-release-event", self.release)
+        self.connect("key-press-event", lambda *_: self.close_overlay())
+        self.timer = None
+
+    def open_at(self, x, y):
+        mon = Gdk.Display.get_default().get_monitor_at_point(x, y)
+        self.geo = mon.get_geometry()
+        GtkLayerShell.set_monitor(self, mon)
+        self.pos = (x - self.geo.x, y - self.geo.y)
+        self.start, self.used = None, False
+        self.show_all()
+        self.timer = GLib.timeout_add_seconds(TIMEOUT_S, self.close_overlay)
+
+    def close_overlay(self):
+        if self.timer:
+            GLib.source_remove(self.timer)
+            self.timer = None
+        self.hide()
+        return False
+
+    def motion(self, _, ev):
+        self.pos = (ev.x, ev.y)
+        self.queue_draw()
+
+    def press(self, _, ev):
+        if self.used or self.start or ev.type != Gdk.EventType.BUTTON_PRESS:
+            return  # one drag per overlay; ignore double-click events
+        if ev.button != 1:
+            return self.close_overlay()
+        if self.timer:
+            GLib.source_remove(self.timer)  # dragging: no timeout
+            self.timer = None
+        self.start = (ev.x, ev.y)
+
+    def release(self, _, ev):
+        if not self.start or self.used:
+            return
+        self.used = True
+        (x0, y0), (x1, y1) = self.start, (ev.x, ev.y)
+        x, y, w, h = int(min(x0, x1)), int(min(y0, y1)), int(abs(x1 - x0)), int(abs(y1 - y0))
+        self.close_overlay()
+        if w > 5 and h > 5:  # wait for the overlay to vanish before the screenshot
+            g = self.geo
+            GLib.timeout_add(150, lambda: self.app.grabbed(x + g.x, y + g.y, w, h) and False)
+
+    def draw(self, _, cr):
+        cr.set_operator(cairo.OPERATOR_SOURCE)
+        cr.set_source_rgba(0, 0, 0, 0.01)  # ~invisible but still receives input
+        cr.paint()
+        cr.set_operator(cairo.OPERATOR_OVER)
+        if self.start:
+            (x0, y0), (x1, y1) = self.start, self.pos
+            cr.rectangle(min(x0, x1), min(y0, y1), abs(x1 - x0), abs(y1 - y0))
+            cr.set_source_rgba(0.4, 0.5, 1, 0.15)
+            cr.fill_preserve()
+            cr.set_source_rgba(0.45, 0.47, 0.96, 0.9)
+            cr.set_line_width(2)
+            cr.stroke()
+        star(cr, *self.pos)
+
+
+def wiggled(hist):
+    """hist: [(t, x, y)]. True on REVERSALS fast, long to-and-fro strokes along any one axis."""
+    strokes, start, prev = [], hist[0], hist[0]
+    for p in hist[1:]:
+        vx, vy = p[1] - prev[1], p[2] - prev[2]
+        sx, sy = prev[1] - start[1], prev[2] - start[2]
+        if abs(vx) + abs(vy) < 3:  # idle / sensor noise
+            continue
+        if vx * sx + vy * sy < 0:  # turned back: close the stroke
+            strokes.append((start, prev))
+            start = prev
+        prev = p
+    strokes.append((start, prev))
+
+    rev, last = 0, None
+    for a, b in strokes:
+        dx, dy, dt = b[1] - a[1], b[2] - a[2], b[0] - a[0]
+        n = math.hypot(dx, dy)
+        if n < MIN_SWING / 4:
+            continue  # tiny wobble at a turn: ignore
+        if n < MIN_SWING or dt > MAX_STROKE_S:
+            rev, last = 0, None  # short or slow stroke breaks the shake
+            continue
+        if last and (dx * last[0] + dy * last[1]) / (n * math.hypot(*last)) <= -MIN_OPPOSITE:
+            rev += 1
+        elif last:
+            rev = 0  # changed axis (circle, zig-zag)
+        last = (dx, dy)
+    return rev >= REVERSALS
+
+
+class App:
+    def __init__(self):
+        sp = Gtk.CssProvider()
+        sp.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), sp, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        self.ov, self.chooser, self.popup = Overlay(self), Chooser(self), Popup()
+        self.hidden = False  # True for Ctrl+Alt+G runs: answer only on Ctrl+Alt+A
+        self.answer, self.seq = None, 0
+
+    def busy(self):
+        return self.ov.get_visible() or self.chooser.get_visible()
+
+    def start(self, hidden):
+        if self.busy():
+            return
+        self.hidden = hidden
+        self.ov.open_at(*cursor())
+
+    def grabbed(self, x, y, w, h):
+        png = subprocess.run(["grim", "-g", f"{x},{y} {w}x{h}", "-"], capture_output=True).stdout
+        if png:
+            self.chooser.open(png, x, y + h + 8)
+
+    def ask(self, png, prompt):
+        self.seq += 1
+        seq, hidden = self.seq, self.hidden
+        self.answer = "…"
+        if not hidden:
+            self.popup.show_text("…", 60_000)
+
+        def work():
+            try:
+                text = ask_llm(shrink(png), prompt)
+            except Exception as e:
+                text = f"⚠ {e}"
+            GLib.idle_add(self.got, seq, hidden, text)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def got(self, seq, hidden, text):
+        if seq != self.seq:
+            return  # a newer question replaced this one
+        self.answer = text
+        if not hidden:
+            self.popup.show_text(text, POPUP_S * 1000)
+        elif self.popup.get_visible():
+            self.popup.label.set_text(text)  # revealed while waiting
+
+    def reveal(self):
+        """SIGUSR2, repeated by key-repeat while Ctrl+Alt+A is held; stop -> hide."""
+        if not self.answer:
+            return True
+        if self.popup.holding:
+            self.popup.hide_in(150)  # repeats arrive every ~40ms
+        else:
+            self.popup.hide()
+            self.popup.show_text(self.answer, 700)  # covers the 600ms key-repeat delay
+            self.popup.holding = True
+        return True
+
+
+def main():
+    subprocess.run(["rm", "-rf", CACHE])
+    app, hist = App(), []
+    ov = app.ov
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, lambda: app.start(True) or True)
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR2, app.reveal)
+
+    def tick():
+        if app.busy():
+            return True
+        now = time.monotonic()
+        try:
+            x, y = cursor()
+        except OSError:  # Hyprland restarted: exit so systemd restarts us with fresh env
+            os._exit(1)
+        hist.append((now, x, y))
+        while now - hist[0][0] > WINDOW_S:
+            hist.pop(0)
+        if wiggled(hist):
+            hist.clear()
+            app.hidden = False
+            ov.open_at(x, y)
+        return True
+
+    GLib.timeout_add(POLL_MS, tick)
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["setup"]:
+        setup()
+    elif os.environ.get("CTS_TEST"):
+        mk = lambda xs, ys=None: [(i * 0.03, x, (ys or [0] * len(xs))[i]) for i, x in enumerate(xs)]
+        assert wiggled(mk([0, 150, 0, 150, 0, 150, 0]))                 # fast + hard, horizontal
+        assert wiggled(mk([0] * 7, [0, 150, 0, 150, 0, 150, 0]))        # vertical
+        assert wiggled(mk([0, 120, 0, 120, 0, 120, 0], [0, 120, 0, 120, 0, 120, 0]))  # diagonal
+        assert not wiggled(mk([0, 60, 0, 60, 0, 60, 0, 60]))          # normal small shake
+        slow = (list(range(0, 300, 20)) + list(range(300, 0, -20))) * 3  # 300px swings at ~670px/s
+        assert not wiggled(mk(slow))
+        assert not wiggled(mk([0, 10, 0, 10, 0, 10, 0, 10]))           # jitter
+        circ = [(i * 0.03, 150 * math.cos(i * 0.9), 150 * math.sin(i * 0.9)) for i in range(30)]
+        assert not wiggled(circ)                                         # fast circles
+        assert not wiggled(mk([0, 150] * 4, [0, 0, 150, 150] * 2))       # zig-zag diagonal
+        assert not wiggled(mk(range(0, 600, 20)))             # straight move
+        print("ok")
+    else:
+        main()

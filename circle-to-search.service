@@ -1,0 +1,12 @@
+[Unit]
+Description=Circle to Search (shake cursor / Ctrl+Alt+G -> Google Lens or AI)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/circle-to-search
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
